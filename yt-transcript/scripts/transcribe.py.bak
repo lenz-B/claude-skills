@@ -1,0 +1,306 @@
+"""Fetch a YouTube video's captions and turn them into a transcript.
+
+    python3 transcribe.py "https://youtu.be/VIDEO_ID"
+    python3 transcribe.py "<url>" --out ~/Desktop/transcript
+    python3 transcribe.py "<url>" --screenshot 1:22 --screenshot 3:05
+    python3 transcribe.py "<url>" --screenshots 4
+
+Needs yt-dlp on PATH (or ~/.local/bin, /opt/homebrew/bin, /usr/local/bin).
+Screenshots also need ffmpeg on PATH. No other third party packages —
+standard library only.
+
+Writes, into the output folder:
+    transcript.txt      plain readable text, one sentence per line
+    transcript.json     source metadata, per-word timestamps, and sentences
+                        with their own start/end times
+    frame_<Ns>.jpg      one per requested timestamp, only when asked for
+
+Word-level timing only exists on YouTube's automatic captions, so those are
+tried first; uploaded subtitles (line-level timing only) are the fallback
+when a video has no automatic captions.
+
+Screenshots are a plain frame grab at a timestamp you choose (or N timestamps
+spread evenly across the video) — nothing scored, nothing picked for you. For
+"find the moments in this video worth a graphic," use the rtf skill instead;
+it reads the picture and ranks moments, this script only ever takes what it's
+told to.
+"""
+import argparse
+import json
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+END_PUNCT = ('.', '?', '!')
+MAX_SENTENCE = 26          # words - a run-on still gets cut somewhere sensible
+NON_SPEECH = re.compile(r'^\[.*\]$')          # [Music], [Applause], [Laughter]
+EXTRA_BINS = [
+    pathlib.Path.home() / '.local/bin',
+    pathlib.Path('/opt/homebrew/bin'),
+    pathlib.Path('/usr/local/bin'),
+]
+
+
+def tool(name):
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in EXTRA_BINS:
+        p = d / name
+        if p.exists():
+            return str(p)
+    sys.exit(f'{name} not found. Install it and try again (pip install {name}).')
+
+
+def run(cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f'{cmd[0]} failed:\n{r.stderr.strip()[:2000]}')
+    return r.stdout
+
+
+def slug(text, limit=60):
+    keep = [c.lower() if c.isalnum() else '-' for c in text]
+    out = ''.join(keep)
+    while '--' in out:
+        out = out.replace('--', '-')
+    return out.strip('-')[:limit] or 'video'
+
+
+def tc(seconds):
+    seconds = max(0.0, float(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    base = f'{int(m):02d}:{int(s):02d}'
+    return f'{int(h)}:{base}' if h else f'{int(m)}:{int(s):02d}'
+
+
+def fetch_captions(url, outdir):
+    """Download captions + metadata for url into outdir. Returns (captions_path, meta)."""
+    ytdlp = tool('yt-dlp')
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Automatic captions carry per-word offsets; uploaded subtitles usually only
+    # time a whole line, so they're the fallback, not the first try.
+    #
+    # The language list is spelled out rather than given as en.* on purpose - that
+    # pattern also matches YouTube's machine translations (en-sq, en-fr, and forty
+    # more), and asking for all of them in one request earns an HTTP 429.
+    common = [ytdlp, '--skip-download', '--sub-format', 'json3', '--no-warnings',
+              '--retries', '5', '--sleep-requests', '0.5',
+              '--sub-langs', 'en-orig,en,en-US,en-GB']
+
+    try:
+        run(common + ['--write-auto-sub', '--write-info-json',
+                      '-o', str(outdir / 'auto.%(ext)s'), url])
+    except RuntimeError as err:
+        print(f'  automatic captions unavailable: {err}', file=sys.stderr)
+    captions = next(iter(sorted(outdir.glob('auto*.json3'))), None)
+
+    if captions is None:
+        try:
+            run(common + ['--write-sub', '--write-info-json',
+                          '-o', str(outdir / 'manual.%(ext)s'), url])
+        except RuntimeError as err:
+            print(f'  uploaded subtitles unavailable: {err}', file=sys.stderr)
+        captions = next(iter(sorted(outdir.glob('manual*.json3'))), None)
+
+    if captions is None:
+        sys.exit('No English captions available for this video - nothing to transcribe.\n'
+                 'If you own the video, turn on automatic captions and try again.')
+
+    info_path = next(iter(sorted(outdir.glob('*.info.json'))), None)
+    info = json.loads(info_path.read_text(encoding='utf-8')) if info_path else {}
+    meta = {
+        'id': info.get('id', ''),
+        'url': info.get('webpage_url', url),
+        'title': info.get('title', ''),
+        'channel': info.get('channel') or info.get('uploader', ''),
+        'duration': info.get('duration', 0),
+    }
+    return captions, meta
+
+
+def parse_words(captions_path):
+    """json3 captions -> [(seconds, word)], in order, de-duplicated."""
+    data = json.loads(pathlib.Path(captions_path).read_text(encoding='utf-8'))
+    words, seen = [], set()
+    for ev in data.get('events', []):
+        segs = ev.get('segs')
+        if not segs:
+            continue
+        base = ev.get('tStartMs', 0)
+        for seg in segs:
+            text = seg.get('utf8', '')
+            if not text.strip() or NON_SPEECH.match(text.strip()):
+                continue
+            t = round((base + seg.get('tOffsetMs', 0)) / 1000.0, 2)
+            key = (t, text.strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            words.append((t, text.strip()))
+    words.sort(key=lambda w: w[0])
+    return words
+
+
+def percentile(values, pct):
+    if not values:
+        return 0.0
+    xs = sorted(values)
+    k = (len(xs) - 1) * (pct / 100.0)
+    lo, hi = int(k), min(int(k) + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+
+
+def pause_threshold(words):
+    """How long a gap has to be, for this speaker, to count as the end of a thought."""
+    gaps = sorted(b[0] - a[0] for a, b in zip(words, words[1:]))
+    if not gaps:
+        return 0.75
+    return min(0.9, max(0.45, percentile(gaps, 92)))
+
+
+def build_sentences(words):
+    """Group words into sentences, keeping the real start and end of each."""
+    pause = pause_threshold(words)
+    out, cur = [], []
+    for i, (t, w) in enumerate(words):
+        cur.append((t, w))
+        nxt = words[i + 1][0] if i + 1 < len(words) else None
+        gap = (nxt - t) if nxt is not None else 99
+        done = ((w.endswith(END_PUNCT) and len(cur) >= 3)
+                or gap >= pause or len(cur) >= MAX_SENTENCE)
+        if done and cur:
+            out.append({'start': cur[0][0], 'end': round(cur[-1][0] + 0.4, 2),
+                        'text': ' '.join(x[1] for x in cur), 'words': len(cur)})
+            cur = []
+    if cur:
+        out.append({'start': cur[0][0], 'end': round(cur[-1][0] + 0.4, 2),
+                    'text': ' '.join(x[1] for x in cur), 'words': len(cur)})
+
+    # Stitch fragments that a mid-sentence pause split apart.
+    merged = []
+    for s in out:
+        if (merged and not re.search(r'[.?!]$', merged[-1]['text'])
+                and merged[-1]['words'] + s['words'] <= MAX_SENTENCE
+                and s['start'] - merged[-1]['end'] < 1.2):
+            merged[-1]['text'] += ' ' + s['text']
+            merged[-1]['end'] = s['end']
+            merged[-1]['words'] += s['words']
+        else:
+            merged.append(dict(s))
+    return merged
+
+
+def parse_timecode(text):
+    """'19', '19.5', '1:22', '1:02:03' -> seconds, in that unit order."""
+    if ':' not in text:
+        return float(text)
+    seconds = 0.0
+    for part in text.split(':'):
+        seconds = seconds * 60 + float(part)
+    return seconds
+
+
+def download_small_copy(url, video_path):
+    """The worst quality that's still >=240p, video only — plenty for a still
+    frame and no audio to throw away. YouTube serves almost nothing as a
+    combined video+audio stream anymore, so a bare 'worst' matches nothing;
+    it has to ask for video specifically."""
+    if not video_path.exists():
+        run([tool('yt-dlp'), '-f', 'worstvideo[height>=240]/worstvideo/worst',
+             '--no-warnings', '-o', str(video_path), url])
+    return video_path
+
+
+def capture_frame(video_path, seconds, out_path):
+    # -ss before -i seeks to the nearest keyframe rather than decoding from
+    # the start, which is what makes this fast on a long video.
+    run([tool('ffmpeg'), '-y', '-ss', str(seconds), '-i', str(video_path),
+         '-frames:v', '1', '-q:v', '2', str(out_path)])
+
+
+def capture_screenshots(url, outdir, timestamps):
+    """Download one small copy of the video, grab a frame at each timestamp,
+    then drop the video — the frames are what's wanted, not the footage."""
+    video_path = outdir / '.video-scratch.mp4'
+    download_small_copy(url, video_path)
+    frames = []
+    # Indexed, not just the rounded second — two requested timestamps close
+    # enough together (e.g. an explicit --screenshot near an evenly spaced
+    # one) can round to the same filename otherwise, and the second capture
+    # would silently overwrite the first.
+    for i, seconds in enumerate(timestamps, 1):
+        out_path = outdir / f'frame_{i:02d}_{int(round(seconds))}s.jpg'
+        capture_frame(video_path, seconds, out_path)
+        frames.append(out_path)
+    video_path.unlink()
+    return frames
+
+
+def transcribe(url, out=None):
+    work = pathlib.Path(out) if out else None
+    tmp_meta_dir = work or pathlib.Path('.tmp-transcribe')
+    captions, meta = fetch_captions(url, tmp_meta_dir)
+
+    words = parse_words(captions)
+    if not words:
+        sys.exit('The captions parsed to zero words - nothing to transcribe.')
+    sentences = build_sentences(words)
+
+    outdir = work or pathlib.Path(f"transcript-{slug(meta['title'] or meta['id'])}")
+    outdir.mkdir(parents=True, exist_ok=True)
+    if outdir != tmp_meta_dir:
+        for f in tmp_meta_dir.glob('*'):
+            shutil.move(str(f), outdir / f.name)
+        tmp_meta_dir.rmdir()
+
+    # Raw yt-dlp scratch files (captions, info.json) aren't useful once parsed.
+    scratch = set(outdir.glob('auto*')) | set(outdir.glob('manual*')) | set(outdir.glob('*.info.json'))
+    for f in scratch:
+        f.unlink()
+
+    (outdir / 'transcript.txt').write_text(
+        '\n'.join(s['text'] for s in sentences), encoding='utf-8')
+    (outdir / 'transcript.json').write_text(json.dumps({
+        'source': meta,
+        'word_count': len(words),
+        'words': [{'t': t, 'w': w} for t, w in words],
+        'sentences': sentences,
+    }, indent=2, ensure_ascii=False), encoding='utf-8')
+
+    return outdir, meta, words, sentences
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser()
+    ap.add_argument('url')
+    ap.add_argument('--out', help='output folder (default: ./transcript-<title>)')
+    ap.add_argument('--screenshot', action='append', default=[], metavar='TIME',
+                     help="grab a frame at this timestamp ('92', '1:32') - repeatable")
+    ap.add_argument('--screenshots', type=int, metavar='N',
+                     help='grab N frames spread evenly across the video')
+    a = ap.parse_args()
+
+    outdir, meta, words, sentences = transcribe(a.url, a.out)
+
+    print(f"{meta['title'] or meta['id']}  ({tc(meta['duration'])})")
+    print(f"{len(words)} words, {len(sentences)} sentences")
+    print(f"-> {outdir}/transcript.txt")
+    print(f"-> {outdir}/transcript.json")
+
+    timestamps = [parse_timecode(t) for t in a.screenshot]
+    if a.screenshots:
+        if not meta['duration']:
+            sys.exit('--screenshots needs a known video duration and this one has none - '
+                      'use --screenshot with explicit timestamps instead.')
+        step = meta['duration'] / (a.screenshots + 1)
+        timestamps += [step * (i + 1) for i in range(a.screenshots)]
+
+    if timestamps:
+        frames = capture_screenshots(a.url, outdir, timestamps)
+        for f in frames:
+            print(f'-> {f}')
