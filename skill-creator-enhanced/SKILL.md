@@ -44,6 +44,23 @@ It's OK to briefly explain terms if you're in doubt, and feel free to clarify te
 
 ## Creating a skill
 
+### Step 0: Is this actually a skill? (primitive gate)
+
+Run this before anything else, and again whenever a requirement says "always" or "never". A skill is a procedure Claude loads on demand. It is a request, not a guarantee (Claude Code docs: an instruction in CLAUDE.md or a skill "is a request, not a guarantee"). Route each requirement to the primitive that can actually deliver it:
+
+| Requirement | Put it in | Not in a skill because |
+|---|---|---|
+| Must hold every time (never edit `.env`, always format after edit, never push to main) | Hook (`PreToolUse` deny, `onFailure: "block"`) + `permissions.deny` | Skills can be skipped or truncated; hooks fail open unless `onFailure: "block"` |
+| True in every session (build command, conventions) | CLAUDE.md / AGENTS.md | A skill may not trigger |
+| Independent check, or "read 50 files, return 1 answer" | Subagent (`.claude/agents/`, `model:` set, tool allowlist) | Same-context review is anchored on the author's reasoning |
+| Live external data or actions | MCP server or CLI | A skill only describes how to use them |
+| State across runs | Committed file the skill writes in its last step | Skills are text; auto memory is machine-local |
+| Recurring / unattended run | Scheduled task or routine that invokes the skill | Skills have no trigger of their own |
+| Side effects (deploy, send, publish, commit) | Skill with `disable-model-invocation: true` (user-only `/name`) | You don't want it auto-triggering |
+| Must run from phone / cloud sessions | Commit the skill into the repo's `.claude/skills/` | Cloud sessions don't load `~/.claude/skills` |
+
+Tell the user in one line which requirements left the skill and where they went. If nothing procedural is left, don't build a skill.
+
 ### Capture Intent
 
 Start by understanding the user's intent. The current conversation might already contain a workflow the user wants to capture (e.g., they say "turn this into a skill"). If so, extract answers from the conversation history first — the tools used, the sequence of steps, corrections the user made, input/output formats observed. The user may need to fill the gaps, and should confirm before proceeding to the next step.
@@ -71,7 +88,11 @@ Based on the user interview, fill in these components:
 - **description**: When to trigger, what it does. This is the primary triggering mechanism - include both what the skill does AND specific contexts for when to use it. All "when to use" info goes here, not in the body. Note: currently Claude has a tendency to "undertrigger" skills -- to not use them when they'd be useful. To combat this, please make the skill descriptions a little bit "pushy". So for instance, instead of "How to build a simple fast dashboard to display internal Anthropic data.", you might write "How to build a simple fast dashboard to display internal Anthropic data. Make sure to use this skill whenever the user mentions dashboards, data visualization, internal metrics, or wants to display any kind of company data, even if they don't explicitly ask for a 'dashboard.'"
   - **Description template**: `"[Core purpose]. Use this skill whenever [trigger inventory: keywords, file types, user intents]. Also use when [hedged cases where user needs it but doesn't name it]. Do NOT use for [exclusion fence: competing skills, out-of-scope tasks]."`
   - Aim for 60–120 words. Under 60 loses trigger surface; over 120 wastes always-loaded context.
+  - Put the key use case first: Claude Code cuts `description` + `when_to_use` at 1,536 chars in the listing.
+  - **Listing budget check (run on every new skill):** `python scripts/budget_check.py`. All model-invocable skill descriptions share a listing budget of 1% of the context window; when it overflows, Claude Code silently drops descriptions of the least-used skills, so they stop auto-triggering. If the check reports over budget, tell the user and offer: (a) `disable-model-invocation: true` on this skill if it's user-invoked, or (b) `"name-only"` in `skillOverrides` (settings.json) for never-used skills — name stays visible, `/name` still works, description cost goes to ~0.
+- **invocation**: decide auto vs user-only. User-only (`disable-model-invocation: true`) for side effects or skills the user always calls by name — zero listing cost.
 - **compatibility**: Required tools, dependencies (optional, rarely needed)
+- **Cost & speed block** (required in every SKILL.md body, short): a `## Cost & speed` section stating (1) model tier per step (Haiku for mechanical extraction/formatting, Sonnet default, Opus only with a one-line reason), (2) whether it fans out to subagents and why (only for breadth-first, independent work; multi-agent costs ~15× chat tokens per Anthropic), (3) loop caps (max retries / rounds), (4) expected token range per run once evals have measured it. Prefer scripts for anything deterministic: a script costs zero tokens to run and never drifts.
 - **the body**: Before writing the body, read `references/design-patterns.md` — it has concrete good/bad examples of every skill component (descriptions, domain primers, decision routers, procedure blocks, constraint catalogs). For annotated complete skills at different complexity levels, see `references/example-skills.md`.
 
 ### Skill Writing Guide
@@ -235,6 +256,8 @@ When each subagent task completes, you receive a notification containing `total_
 ```
 
 This is the only opportunity to capture this data — it comes through the task notification and isn't persisted elsewhere. Process each notification as it arrives rather than trying to batch them.
+
+**Cost is a pass/fail criterion, not just a report.** Compare with-skill vs baseline on tokens and time as well as quality. A skill that matches baseline quality at more tokens is a regression; flag it. A with-skill run that costs >1.5× baseline tokens needs a stated reason (e.g. it runs a verifier) or it gets trimmed. Write the measured range into the skill's `## Cost & speed` block.
 
 ### Step 4: Grade, aggregate, and launch the viewer
 
