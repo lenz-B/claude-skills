@@ -167,13 +167,29 @@ Try to explain to the model why things are important in lieu of heavy-handed mus
 
 ### Body Structure
 
-When writing the SKILL.md body, aim for this internal structure:
+When writing the SKILL.md body, use this order (taken from Anthropic's strongest skills: docx, pptx, xlsx). Load-bearing rules go in the first ~5k tokens: after compaction Claude Code keeps only the first 5,000 tokens of a skill.
 
 1. **Domain primer** (1–3 sentences) — establish a mental model for the domain. Good: "A .docx file is a ZIP archive containing XML files." Bad: "This skill helps you create documents." (That restates the description and wastes tokens.)
-2. **Decision router** — if the skill has 2+ task paths, include a quick-reference table mapping task types to approaches or section pointers. This lets Claude jump to the right procedure without reading linearly.
-3. **Procedure blocks** (one per task path) — each block should include: setup/prerequisites, step-by-step instructions (imperative voice, concrete code templates), a validation step, and a recovery path for when things fail.
-4. **Constraint catalog** — a dedicated "Critical Rules" or "Known Pitfalls" section. Each rule needs three parts: the rule name, what to do/not do, and why (the failure mode). These accumulate over iterations as you discover what goes wrong.
-5. **Dependencies** — list every tool, library, or external resource needed.
+2. **Decision router** — "Choose your approach by task": a table with ONE default per task path, plus one escape-hatch line. Defaults, not menus.
+3. **Invariants** — what every output must satisfy, stated literally. The user's own conventions override.
+4. **Scripts table** (if any) — path, what it does, exact invocation, what its output/exit code means. For big scripts: "run `--help`, don't read the source".
+5. **Procedure blocks** (one per task path) — setup, imperative steps, a validation step, a recovery path.
+6. **Gotchas** — only what the model gets wrong, never what it already knows. Format: **area:** right form — never wrong form (consequence: corrupts / silently ignored / renders wrong). A hard NEVER only for corruption or unrecoverable state; everything else gets a reason. Most of a strong skill's length is here.
+7. **Stale-prior table** (when the model's habits are wrong for this domain) — | what the model does by default | when that's acceptable | what to do instead |.
+8. **Verification loop** — deterministic check first (script/validator), then render-and-look or a fresh-context verifier subagent; bounded ("fix, recheck only what changed, stop after 2 rounds"); say what a green check does NOT prove.
+9. **Cost & speed** block, then the **Runs on** footer (`references/surfaces.md`).
+
+For output that comes out the wrong *shape*, write the right recipe (a positive template), not a list of prohibitions.
+
+#### Discipline skills: rationalization table
+
+For skills that enforce a process the model is tempted to skip (verification, grading, git hygiene, research rigor): run the baseline (no skill) on 2–3 pressure prompts ("quick one, skip the checks") and record the exact excuses the model gives for cutting corners. Turn them into a table near the top:
+
+| If you're thinking… | Reality |
+|---|---|
+| "This is too small to need the check" | {{what goes wrong when it's skipped}} |
+
+Plus a short **Red flags — stop** list of the phrases that signal a skip. Built from observed excuses only, never invented ones. (superpowers and Trail of Bits use this heavily; Anthropic's skills don't.)
 
 Every constraint in the body should explain *why* it exists. "Never use `\n`" should become "Never use `\n` — use separate Paragraph elements, because newline characters produce invalid XML in this format." This lets the model generalize the rule to novel situations.
 
@@ -365,13 +381,7 @@ Keep going until:
 
 ---
 
-## Advanced: Blind comparison
-
-For situations where you want a more rigorous comparison between two versions of a skill (e.g., the user asks "is the new version actually better?"), there's a blind comparison system. Read `agents/comparator.md` and `agents/analyzer.md` for the details. The basic idea is: give two outputs to an independent agent without telling it which is which, and let it judge quality. Then analyze why the winner won.
-
-This is optional, requires subagents, and most users won't need it. The human review loop is usually sufficient.
-
----
+**Blind comparison (optional):** "is the new version actually better?" → read `agents/comparator.md` and `agents/analyzer.md`: an independent agent judges two unlabeled outputs, then you analyze why the winner won.
 
 ## Description Optimization
 
@@ -460,44 +470,10 @@ After packaging, direct the user to the resulting `.skill` file path so they can
 
 ---
 
-## Claude.ai-specific instructions
+## Other surfaces (Claude.ai, Cowork) and the Runs-on footer
 
-In Claude.ai, the core workflow is the same (draft → test → review → improve → repeat), but because Claude.ai doesn't have subagents, some mechanics change. Here's what to adapt:
+Running this skill-creator on Claude.ai or Cowork, or building a skill that must run there, from the phone or in a cloud routine: read `references/surfaces.md`. Every skill you build ends with the `## Runs on` footer described there.
 
-**Running test cases**: No subagents means no parallel execution. For each test case, read the skill's SKILL.md, then follow its instructions to accomplish the test prompt yourself. Do them one at a time. This is less rigorous than independent subagents (you wrote the skill and you're also running it, so you have full context), but it's a useful sanity check — and the human review step compensates. Skip the baseline runs — just use the skill to complete the task as requested.
-
-**Reviewing results**: If you can't open a browser (e.g., Claude.ai's VM has no display, or you're on a remote server), skip the browser reviewer entirely. Instead, present results directly in the conversation. For each test case, show the prompt and the output. If the output is a file the user needs to see (like a .docx or .xlsx), save it to the filesystem and tell them where it is so they can download and inspect it. Ask for feedback inline: "How does this look? Anything you'd change?"
-
-**Benchmarking**: Skip the quantitative benchmarking — it relies on baseline comparisons which aren't meaningful without subagents. Focus on qualitative feedback from the user.
-
-**The iteration loop**: Same as before — improve the skill, rerun the test cases, ask for feedback — just without the browser reviewer in the middle. You can still organize results into iteration directories on the filesystem if you have one.
-
-**Description optimization**: This section requires the `claude` CLI tool (specifically `claude -p`) which is only available in Claude Code. Skip it if you're on Claude.ai.
-
-**Blind comparison**: Requires subagents. Skip it.
-
-**Packaging**: The `package_skill.py` script works anywhere with Python and a filesystem. On Claude.ai, you can run it and the user can download the resulting `.skill` file.
-
-**Updating an existing skill**: The user might be asking you to update an existing skill, not create a new one. In this case:
-- **Preserve the original name.** Note the skill's directory name and `name` frontmatter field -- use them unchanged. E.g., if the installed skill is `research-helper`, output `research-helper.skill` (not `research-helper-v2`).
-- **Copy to a writeable location before editing.** The installed skill path may be read-only. Copy to `/tmp/skill-name/`, edit there, and package from the copy.
-- **If packaging manually, stage in `/tmp/` first**, then copy to the output directory -- direct writes may fail due to permissions.
-
----
-
-## Cowork-Specific Instructions
-
-If you're in Cowork, the main things to know are:
-
-- You have subagents, so the main workflow (spawn test cases in parallel, run baselines, grade, etc.) all works. (However, if you run into severe problems with timeouts, it's OK to run the test prompts in series rather than parallel.)
-- You don't have a browser or display, so when generating the eval viewer, use `--static <output_path>` to write a standalone HTML file instead of starting a server. Then proffer a link that the user can click to open the HTML in their browser.
-- For whatever reason, the Cowork setup seems to disincline Claude from generating the eval viewer after running the tests, so just to reiterate: whether you're in Cowork or in Claude Code, after running tests, you should always generate the eval viewer for the human to look at examples before revising the skill yourself and trying to make corrections, using `generate_review.py` (not writing your own boutique html code). Sorry in advance but I'm gonna go all caps here: GENERATE THE EVAL VIEWER *BEFORE* evaluating inputs yourself. You want to get them in front of the human ASAP!
-- Feedback works differently: since there's no running server, the viewer's "Submit All Reviews" button will download `feedback.json` as a file. You can then read it from there (you may have to request access first).
-- Packaging works — `package_skill.py` just needs Python and a filesystem.
-- Description optimization (`run_loop.py` / `run_eval.py`) should work in Cowork just fine since it uses `claude -p` via subprocess, not a browser, but please save it until you've fully finished making the skill and the user agrees it's in good shape.
-- **Updating an existing skill**: The user might be asking you to update an existing skill, not create a new one. Follow the update guidance in the claude.ai section above.
-
----
 
 ## Reference files
 
@@ -512,20 +488,13 @@ The references/ directory has additional documentation:
 - `references/design-patterns.md` — Concrete good/bad examples of every skill component: descriptions, domain primers, decision routers, procedure blocks, constraint catalogs, test prompts, and resource organization patterns. Read during skill writing (Phase: Write the SKILL.md) for templates and anti-patterns.
 - `references/quality-checklist.md` — 5-tier, 22-criteria evaluation checklist for assessing skill quality before shipping. Covers structural validity, instruction quality, robustness, trigger reliability, and maintainability. Read during skill improvement to catch gaps before re-testing.
 - `references/example-skills.md` — Three annotated complete skills at different complexity levels (simple flat, multi-procedure with router, multi-domain with references and scripts). Read when choosing architecture or when you want to see the design patterns in action.
+- `references/surfaces.md` — Claude.ai / Cowork mechanics and the Runs-on footer.
 
----
+## Validate the skill
+`scripts/quick_validate.py <skill>` fails on spec errors and prints WARN lines for quality gaps; `scripts/budget_check.py` checks the listing budget.
 
-Repeating one more time the core loop here for emphasis:
+## Cost & speed
+Drafting and edits: current model. Eval runs: Sonnet subagents, with-skill and baseline in parallel (the only fan-out; it's independent work). Grading and mechanical checks: Haiku. Description loop: max 5 iterations. Skip evals only when the user says so.
 
-- Figure out what the skill is about
-- Draft or edit the skill
-- Run claude-with-access-to-the-skill on test prompts
-- With the user, evaluate the outputs:
-  - Create benchmark.json and run `eval-viewer/generate_review.py` to help the user review them
-  - Run quantitative evals
-- Repeat until you and the user are satisfied
-- Package the final skill and return it to the user.
-
-Please add steps to your TodoList, if you have such a thing, to make sure you don't forget. If you're in Cowork, please specifically put "Create evals JSON and run `eval-viewer/generate_review.py` so human can review test cases" in your TodoList to make sure it happens.
-
-Good luck!
+## Runs on
+Claude Code (full). Claude.ai and Cowork: see `references/surfaces.md` (no baselines on Claude.ai; static viewer on Cowork).
